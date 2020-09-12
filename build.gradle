@@ -10,11 +10,16 @@ plugins {
 }
 
 group = 'io.resiliency'
-version = '0.0.1-SNAPSHOT'
+//version = '0.0.1-SNAPSHOT'
+archivesBaseName = 'app'
 sourceCompatibility = '14'
 
 repositories {
 	mavenCentral()
+}
+
+bootJar {
+    layered()
 }
 
 dependencies {
