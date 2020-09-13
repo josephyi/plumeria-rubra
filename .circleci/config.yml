@@ -1,0 +1,177 @@
+version: 2.1
+
+orbs:
+  docker: circleci/docker@1.0.1
+commands:
+  docker-publish:
+    description: Publish to Docker Registry
+    parameters:
+      registry_host:
+        description: Host name of registry
+        type: string
+        default: ""
+      registry_username:
+        type: string
+      registry_password:
+        type: string
+      image_load_path:
+        type: string
+      source_image:
+        type: string
+      target_image:
+        type: string
+    steps:
+      - setup_remote_docker:
+          version: 19.03.8
+      - run:
+          name: Login to Docker Registry
+          command: |
+            echo "<< parameters.registry_password >>" | docker login \
+            --username << parameters.registry_username >> \
+            --password-stdin \
+            << parameters.registry_host >>
+      - run:
+          name: Load archived Docker image
+          command: docker load -i << parameters.image_load_path >>
+      - run:
+          name: Tag Docker image
+          command: docker tag << parameters.source_image >> << parameters.target_image >>
+      - run:
+          name: Publish Docker image
+          command: docker push << parameters.target_image >>
+  deploy-by-tag:
+    description: Simulate a deploy command
+    parameters:
+      tag:
+        description: Image tag
+        type: string
+    steps:
+      - run: echo "Deploying << parameters.tag >>"
+jobs:
+  build-and-test:
+    docker:
+      - image: cimg/openjdk:14.0.2
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - gradle-{{ .Environment.CACHE_VERSION }}-{{ .Branch }}-{{ checksum "gradle.lockfile" }}
+            - gradle-{{ .Environment.CACHE_VERSION }}-{{ .Branch }}-
+            - gradle-{{ .Environment.CACHE_VERSION }}-
+      - run: ./gradlew test
+      - save_cache:
+          paths:
+            - ~/.gradle
+          key: gradle-{{ .Environment.CACHE_VERSION }}-{{ .Branch }}-{{ checksum "gradle.lockfile" }}
+  build-docker-image:
+    executor:
+      name: docker/docker
+    working_directory: /mnt/ramdisk
+    environment:
+      DOCKER_BUILDKIT: "1"
+      IMAGE_NAME: "josephyi/plumeria-rubra"
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 19.03.8
+      - attach_workspace:
+          at: /mnt/ramdisk/workspace
+      - docker/build:
+          image: $IMAGE_NAME
+          extra_build_args: --progress=plain
+      - run:
+          name: Archive Docker image
+          command: docker save $IMAGE_NAME | gzip > image.tar.gz
+      - persist_to_workspace:
+          root: .
+          paths:
+            - ./image.tar.gz
+  scan-image:
+    docker:
+      - image: cimg/base:stable
+    working_directory: /mnt/ramdisk
+    steps:
+      - attach_workspace:
+          at: /mnt/ramdisk/workspace
+      - run:
+          name: Trivy
+          command: |
+            VERSION=$(
+                curl --silent "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | \
+                grep '"tag_name":' | \
+                sed -E 's/.*"v([^"]+)".*/\1/'
+            )
+
+            wget https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-64bit.tar.gz
+            tar zxvf trivy_${VERSION}_Linux-64bit.tar.gz
+            ./trivy --exit-code 0 --no-progress image --input /mnt/ramdisk/workspace/image.tar.gz      
+  publish-image:
+    docker:
+      - image: cimg/base:stable
+    environment:
+      IMAGE_NAME: "josephyi/plumeria-rubra"
+    steps:
+      - attach_workspace:
+          at: /mnt/ramdisk/workspace
+      - docker-publish:
+          registry_username: ${DOCKER_LOGIN}
+          registry_password: ${DOCKER_PASSWORD}
+          image_load_path: /mnt/ramdisk/workspace/image.tar.gz
+          source_image: $(docker images -q ${IMAGE_NAME})
+          target_image: ${IMAGE_NAME}:${CIRCLE_SHA1}
+  publish-image-gh:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - attach_workspace:
+          at: /mnt/ramdisk/workspace
+      - run: 
+          name: ✨ Setup Image Tag Environment Variable ✨
+          command: |
+            echo 'export IMAGE_NAME="${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}"' >> ${BASH_ENV}
+            echo 'export GH_IMAGE_NAME="${IMAGE_NAME}/${CIRCLE_PROJECT_REPONAME}:${CIRCLE_SHA1}"' >> ${BASH_ENV}
+            echo 'export IMAGE_REF="${GH_REGISTRY_HOST}/${GH_IMAGE_NAME}"' >> ${BASH_ENV}
+      - docker-publish:
+          registry_host: ${GH_REGISTRY_HOST}
+          registry_username: ${GH_REGISTRY_USERNAME}
+          registry_password: ${GH_REGISTRY_PASSWORD}
+          image_load_path: /mnt/ramdisk/workspace/image.tar.gz
+          source_image: $(docker images -q ${IMAGE_NAME}) 
+          target_image: ${IMAGE_REF}
+  deploy-by-tag:
+    executor: docker/docker
+    steps:
+      - checkout
+      - deploy-by-tag:
+          tag: $CIRCLE_SHA1
+workflows:
+  build-and-test:
+    jobs:
+      - build-and-test
+      - build-docker-image
+      - scan-image:
+          requires:
+            - build-docker-image
+      - publish-image:
+          requires:
+            - scan-image
+      - publish-image-gh:
+          requires:
+            - scan-image
+  deploy:
+    jobs:
+      - approve:
+          type: approval
+          filters:
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/
+      - deploy-by-tag:
+          requires:
+            - approve
+          filters:
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/

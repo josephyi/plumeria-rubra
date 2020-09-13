@@ -13,8 +13,9 @@ COPY gradlew ./gradlew
 RUN ./gradlew --no-daemon
 
 FROM gradle as deps
-WORKDIR /workspace
 COPY build.gradle ./build.gradle
+COPY settings.gradle ./settings.gradle
+COPY gradle.lockfile ./gradle.lockfile
 COPY src ./src
 RUN --mount=type=cache,target=/root/.gradle ./gradlew dependencies -q --parallel --no-daemon
 
